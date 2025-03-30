@@ -99,8 +99,8 @@ def minimax(board, depth, maxPlayer, space=0):
         for move in validMoves:
             newBoard = makeMove(board, move, AiPlayer)
             print(spaceStr + f"Max Trying Move: {move}")
-            printBoard(newBoard)
-            newValue, _ = minimax(newBoard, depth - 1, False, space + 1)  # minimize next turn
+            # printBoard(newBoard)
+            newValue, retMove = minimax(newBoard, depth - 1, False, space + 1)  # minimize next turn
             if newValue > maxValue:
                 maxValue = newValue
                 bestMove = move
@@ -112,8 +112,8 @@ def minimax(board, depth, maxPlayer, space=0):
             newBoard = makeMove(board, move, HumanPlayer)
             print(spaceStr + f"Min Trying Move: {move}")
             #printBoard(newBoard)
-            newValue, _ = minimax(newBoard, depth - 1, True,space + 1)  # maximize next turn
-            if newValue > minValue:
+            newValue, retMove = minimax(newBoard, depth - 1, True,space + 1)  # maximize next turn
+            if newValue < minValue:
                 minValue = newValue
                 bestMove = move
         return minValue, bestMove
