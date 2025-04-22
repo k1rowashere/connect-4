@@ -9,7 +9,23 @@ from graphviz import Digraph
 
 ENABLE_ALPHA_BETA = True
 ENABLE_EXPECTIMINIMAX = False
-ENABLE_CPP_MINIMAX = True
+
+
+class MinimaxRet(ctypes.Structure):
+    _fields_ = [
+        ("score", ctypes.c_int),
+        ("col", ctypes.c_int),
+    ]
+
+
+lib = ctypes.CDLL(r"./libconnect4_eval.dll")
+lib.minimax.argtypes = [
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_int,
+    ctypes.c_int,
+]
+lib.minimax.restype = MinimaxRet
 
 ROWS, COLUMNS = 6, 7
 
@@ -157,12 +173,9 @@ class GameState:
     def evaluate_final(self) -> int:
         score = 0
         for bitmask in BITMASKS:
-            player = collect_bits(self.red, bitmask)
-            opponent = collect_bits(self.yellow, bitmask)
-
-            if player == 0b1111:
+            if self.red & bitmask == bitmask:
                 score += 1
-            if opponent == 0b1111:
+            if self.yellow & bitmask == bitmask:
                 score -= 1
         return score
 
@@ -172,8 +185,8 @@ class GameState:
             return 0
 
         # collect bits
-        player = collect_bits(self.red, bitmask)
-        opponent = collect_bits(self.yellow, bitmask)
+        player = (self.red & bitmask).bit_count()
+        opponent = (self.yellow & bitmask).bit_count()
 
         # the left adjacent piece (to check for 3 in a row, with 2 empty spaces)
         # adjacent = bitmask.first_bit_set() - 1
@@ -184,16 +197,11 @@ class GameState:
         if opponent != 0:
             return 0  # this will never lead to a connect-4
 
-        if player == 0b1111:
-            return 10_000_000  # feature 1
-        elif player == 0b0111 \
-                or player == 0b1011 \
-                or player == 0b1101 \
-                or player == 0b1110:
+        if player == 4:
+            return 15_000_000  # feature 1
+        elif player == 3:
             return 900_000  # feature 2.2 & feature 2.3
-        elif player == 0b1100 \
-                or player == 0b0110 \
-                or player == 0b0011:
+        elif player == 2:
             return 50_000  # feature 3 (approximate)
 
         return 0
@@ -212,7 +220,7 @@ class GameState:
             legal_moves = list(game_copy.legal_moves())
 
         if len(legal_moves) == 0:
-            return game_copy.evaluate_final() * 10_000_000
+            return game_copy.evaluate_final() * 15_000_000
 
         score = 0
         for bitmask in BITMASKS:
@@ -345,7 +353,7 @@ def minimax(game_state: GameState,
                 best_move = moves[0]
                 best_score = scores[best_move]
             case (l, None):
-                best_score = scores[l] + 0.4 * scores[best_move]
+                best_score = 0.4 * scores[l] + 0.6 * scores[best_move]
                 best_move = rng.choice(moves, p=[0.6, 0.4, 0.0])
             case (None, r):
                 best_score = 0.4 * scores[r] + 0.6 * scores[best_move]
@@ -353,6 +361,7 @@ def minimax(game_state: GameState,
             case (l, r):
                 best_score = 0.2 * scores[l] + 0.2 * scores[r] + 0.6 * scores[best_move]
                 best_move = rng.choice(moves, p=[0.6, 0.2, 0.2])
+        best_move = int(best_move)
 
     tree.score = best_score
 
@@ -377,18 +386,19 @@ def main():
     while not game.is_game_over():
         TRANSPOSITION_TABLE.clear()
         start = time.time()
-        if ENABLE_CPP_MINIMAX:
-            score, move = minimax_cpp(game, 13)
+        if False:
+            score, move = minimax_cpp(game, 11)
         else:
-            score, move, tree = minimax(game, 7)
+            score, move, tree = minimax(game, 4)
         print(f"Bot {game.turn}: Move: {move} ({time.time() - start:.2f}s)")
         print(f"Score: {score}")
-        # build_graph(tree).render('game_tree')
+        build_graph(tree).render('game_tree')
 
         game.make_move(move)
         print(game.print_colored())
         # print(game)
 
+        break
         if game.is_game_over():
             break
 
@@ -396,39 +406,32 @@ def main():
     print(game.evaluate_final())
 
 
-def collect_bits(number: int, mask: int) -> int:
-    result = 0
-    bit_pos = 0
+def play(game, engine, depth):
+    TRANSPOSITION_TABLE.clear()
+    global ENABLE_ALPHA_BETA
+    global ENABLE_EXPECTIMINIMAX
 
-    while mask:
-        rightmost_mask_bit = mask & -mask
-        if number & rightmost_mask_bit:
-            result |= (1 << bit_pos)
-        bit_pos += 1
-        mask &= mask - 1
-
-    return result
-
-
-def load_cpp_lib():
-    class MinimaxRet(ctypes.Structure):
-        _fields_ = [
-            ("score", ctypes.c_int),
-            ("col", ctypes.c_int),
-        ]
-
-    lib = ctypes.CDLL(r"./libconnect4_eval.dll")
-    lib.minimax.argtypes = [
-        ctypes.c_uint64,
-        ctypes.c_uint64,
-        ctypes.c_int,
-        ctypes.c_int,
-    ]
-    lib.minimax.restype = MinimaxRet
-    return lib
+    match engine:
+        case "human":
+            raise NotImplementedError("Human player not implemented")
+        case "minimax_python":
+            ENABLE_EXPECTIMINIMAX = False
+            ENABLE_ALPHA_BETA = False
+            return minimax(game, depth)
+        case "minimax_ab_python":
+            ENABLE_EXPECTIMINIMAX = False
+            ENABLE_ALPHA_BETA = True
+            return minimax(game, depth)
+        case "expectiminimax":
+            ENABLE_EXPECTIMINIMAX = True
+            ENABLE_ALPHA_BETA = False
+            return minimax(game, depth)
+        case "minimax_cpp":
+            score, move = minimax_cpp(game, depth)
+            return score, move, None
+        case _:
+            raise ValueError(f"Unknown engine: {engine}")
 
 
 if __name__ == "__main__":
-    if ENABLE_CPP_MINIMAX:
-        lib = load_cpp_lib()
     main()

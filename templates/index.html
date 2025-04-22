@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Connect 4</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body class="flex flex-row justify-evenly items-center w-full h-screen p-10 bg-gray-100">
+<div class="board relative">
+    <!-- 6 rows x 7 columns grid -->
+    <div id="grid" class="grid">
+        <!-- Cells will be dynamically populated by JavaScript -->
+    </div>
+
+    <!-- Columns for dropping pieces -->
+    <div class="columns">
+        <div class="column" data-column="0"></div>
+        <div class="column" data-column="1"></div>
+        <div class="column" data-column="2"></div>
+        <div class="column" data-column="3"></div>
+        <div class="column" data-column="4"></div>
+        <div class="column" data-column="5"></div>
+        <div class="column" data-column="6"></div>
+    </div>
+    <div class="absolute w-[107%] -left-[3.5%] top-[69.5%]">
+        <img src="/assets/stands.svg" alt="Stands" class="w-full">
+    </div>
+    <div class="absolute -z-50 w-[123.5%] -left-[11.75%] -top-[5%]">
+        <img src="/assets/background.svg" alt="background" class="w-full">
+    </div>
+</div>
+
+<div class="w-96 p-6 rounded-2xl shadow-2xl bg-white h-full flex flex-col justify-center items-center">
+    {% set players = ["red", "yellow"] %}
+    {% for player in players %}
+    <div class="border-gray-300 border-b mb-2 pb-2 w-full flex flex-col gap-4" id="player{{ loop.index }}-settings">
+        <h3 class="text-2xl text-gray-900 font-bold">
+            <img src="/assets/{{ player }}.svg" alt="{{ player | capitalize }} Circle"
+                 class="inline-block h-5 mr-1">
+            Player {{ loop.index }}
+        </h3>
+        <div class="flex gap-4 items-center">
+            <label for="player{{ loop.index }}-engine">Engine:</label>
+            <select id="player{{ loop.index }}-engine" class="engine-select">
+                <option value="human">Human</option>
+                <option value="minimax_python">Minimax (Python)</option>
+                <option value="minimax_ab_python">Minimax with AB (Python)</option>
+                <option value="expectiminimax">Expectiminimax</option>
+                <option value="minimax_cpp">Minimax (C++)</option>
+            </select>
+        </div>
+        <div>
+            <label for="player{{ loop.index }}-depth">Depth:</label>
+            <input type="range" id="player{{ loop.index }}-depth" class="depth-slider" min="1" max="5" value="3">
+            <span id="player{{ loop.index }}-depth-value">3</span>
+        </div>
+    </div>
+    {% endfor %}
+    <button id="start-game"
+            class="bg-pink-500 text-white px-4 py-2 rounded
+                hover:bg-pink-600 w-full mt-4 active:  cursor-pointer"
+    >
+        Restart Game
+    </button>
+
+
+    <div id="turn-indicator" class="mt-auto w-full bg-blue-700/80 rounded-2xl border-blue-950 border-2 p-4 text-white">
+        <div class="">
+            <div class="flex flex-col">
+                Current turn:
+                <span class="text-2xl mb-2 self-center font-extrabold">Player 1</span>
+                <img src="/assets/red.svg" alt="Red Circle" class="h-24 inline-block">
+
+            </div>
+        </div>
+        <div class="hidden">
+            <div class="flex flex-col">
+                Current turn:
+                <span class="text-2xl mb-2 self-center font-extrabold">Player 2</span>
+                <img src="/assets/yellow.svg" alt="Red Circle" class="h-24 inline-block">
+            </div>
+        </div>
+    </div>
+</div>
+
+
+<script src="/app.js"></script>
+</body>
+</html>
