@@ -1,28 +1,41 @@
 import copy
+import ctypes
 import time
 from enum import Enum
 from typing import Generator, Tuple
-import ctypes
-
-from graphviz import Digraph
-from numpy.ctypeslib import ndpointer
 
 import numpy as np
+from graphviz import Digraph
 
 ENABLE_ALPHA_BETA = True
 ENABLE_EXPECTIMINIMAX = False
 ENABLE_CPP_MINIMAX = True
 
-TRANSPOSITION_TABLE = {}
+ROWS, COLUMNS = 6, 7
 
-OFFSETS = np.array([
-    [(0, 0), (0, 1), (0, 2), (0, 3)],  # horizontal
-    [(0, 0), (1, 0), (2, 0), (3, 0)],  # vertical
-    [(0, 0), (1, 1), (2, 2), (3, 3)],  # diagonal down-right
-    [(0, 0), (1, -1), (2, -2), (3, -3)],  # diagonal down-left
-], dtype=np.int8)
 
+def generate_bitmask(row: int, col: int) -> np.ndarray:
+    """
+    Generate bitmasks for all possible winning positions in a Connect-4 game.
+    :param row: Number of rows
+    :param col: Number of columns
+    :return: Array of bitmasks
+    """
+    col = int(col)
+    row = int(row)
+    v = 1 | (1 << col) | (1 << (2 * col)) | (1 << (3 * col))
+    dr = 1 | (1 << (col + 1)) | (1 << (2 * col + 2)) | (1 << (3 * col + 3))
+    dl = 1 | (1 << (col - 1)) | (1 << (2 * col - 2)) | (1 << (3 * col - 3))
+    horizontal = [0b1111 << (i * col + j) for i in range(row) for j in range(col - 3)]
+    vertical = [v << (i * col + j) for i in range(row - 3) for j in range(col)]
+    diagonal_dr = [dr << (i * col + j) for i in range(row - 3) for j in range(col - 3)]
+    diagonal_dl = [dl << (i * col + j) for i in range(row - 3) for j in range(3, col)]
+    return np.array([*horizontal, *vertical, *diagonal_dr, *diagonal_dl])
+
+
+BITMASKS = generate_bitmask(ROWS, COLUMNS)
 COLUMN_SCORE = [100, 200, 500, 800, 500, 200, 100]
+TRANSPOSITION_TABLE = {}
 
 
 class Player(Enum):
@@ -31,8 +44,190 @@ class Player(Enum):
     YELLOW = -1
 
 
+class GameState:
+    def __init__(self):
+        assert ROWS <= 8 and COLUMNS <= 8, "Board too large for 64-bit representation"
+
+        # Bitboard representation (2x 64-bit integers)
+        self.red = 0  # Bitmask for red pieces (Player.RED)
+        self.yellow = 0  # Bitmask for yellow pieces (Player.YELLOW)
+        self.turn = Player.RED
+
+    def __getitem__(self, key: Tuple[int, int]) -> Player:
+        row, col = key
+        mask = 1 << (row * COLUMNS + col)
+
+        if self.red & mask:
+            return Player.RED
+        elif self.yellow & mask:
+            return Player.YELLOW
+        else:
+            return Player.NONE
+
+    def __hash__(self):
+        # to respect the symmetry of the board,
+        # the hash of the flipped board is the same as the original
+        # where the original is the smaller of the two
+
+        flipped_yellow = 0
+        flipped_red = 0
+        mask = (1 << COLUMNS) - 1  # Mask for one row
+        tmp_yellow = self.yellow
+        tmp_red = self.red
+
+        # flip each row
+        for row in range(ROWS):
+            yellow_bits = bin(tmp_yellow & mask)[2:].zfill(COLUMNS)
+            red_bits = bin(tmp_red & mask)[2:].zfill(COLUMNS)
+
+            reversed_yellow = int(yellow_bits[::-1], 2)
+            reversed_red = int(red_bits[::-1], 2)
+
+            flipped_yellow |= reversed_yellow << (row * COLUMNS)
+            flipped_red |= reversed_red << (row * COLUMNS)
+
+            tmp_yellow >>= COLUMNS
+            tmp_red >>= COLUMNS
+
+        original_hash = (self.red << 64) | self.yellow
+        flipped_hash = (flipped_red << 64) | flipped_yellow
+
+        return min(original_hash, flipped_hash)
+
+    def __repr__(self):
+        board_str = ""
+        for row in range(ROWS):
+            board_str += "|"
+            for col in range(COLUMNS):
+                player = self[row, col]
+                if player == Player.RED:
+                    board_str += "x|"
+                elif player == Player.YELLOW:
+                    board_str += "o|"
+                else:
+                    board_str += " |"
+            board_str += "\n"
+        return board_str
+
+    def print_colored(self) -> str:
+        board_str = (str(self)
+                     .replace('x', '\033[91m●\033[0m')
+                     .replace('o', '\033[93m●\033[0m'))
+        return board_str
+
+    def is_game_over(self):
+        mask = 2 ** COLUMNS - 1
+        return (self.yellow | self.red) & mask == mask
+
+    def make_move(self, move_col: int) -> None:
+        if self[0, move_col] != Player.NONE:
+            raise ValueError(f"Column {move_col} is full")
+        # Find the lowest empty row in the column
+        row = ROWS - 1
+        while row >= 0 and self[row, move_col] != Player.NONE:
+            row -= 1
+
+        if self.turn == Player.RED:
+            self.red |= 1 << (row * COLUMNS + move_col)
+            self.turn = Player.YELLOW
+        else:
+            self.yellow |= 1 << (row * COLUMNS + move_col)
+            self.turn = Player.RED
+
+    @staticmethod
+    def column_order():
+        n = COLUMNS // 2
+        yield n
+        i = 1
+        while i <= n:
+            yield n + i
+            yield n - i
+            i += 1
+
+    def legal_moves(self) -> Generator[int, None, None]:
+        """
+        valid moves, with move ordering optimisation (center moves first)
+        :return: iterator for moves
+        """
+
+        for c in self.column_order():
+            if self[0, c] == Player.NONE:
+                yield c
+
+    def evaluate_final(self) -> int:
+        score = 0
+        for bitmask in BITMASKS:
+            player = collect_bits(self.red, bitmask)
+            opponent = collect_bits(self.yellow, bitmask)
+
+            if player == 0b1111:
+                score += 1
+            if opponent == 0b1111:
+                score -= 1
+        return score
+
+    def eval_features(self, bitmask: int, turn: Player) -> int:
+        # mask within the board there are 4 ones
+        if bitmask.bit_count() != 4:
+            return 0
+
+        # collect bits
+        player = collect_bits(self.red, bitmask)
+        opponent = collect_bits(self.yellow, bitmask)
+
+        # the left adjacent piece (to check for 3 in a row, with 2 empty spaces)
+        # adjacent = bitmask.first_bit_set() - 1
+
+        if turn == Player.YELLOW:
+            player, opponent = opponent, player
+
+        if opponent != 0:
+            return 0  # this will never lead to a connect-4
+
+        if player == 0b1111:
+            return 10_000_000  # feature 1
+        elif player == 0b0111 \
+                or player == 0b1011 \
+                or player == 0b1101 \
+                or player == 0b1110:
+            return 900_000  # feature 2.2 & feature 2.3
+        elif player == 0b1100 \
+                or player == 0b0110 \
+                or player == 0b0011:
+            return 50_000  # feature 3 (approximate)
+
+        return 0
+
+    def evaluate(self) -> int:
+        """
+        https://researchgate.net/publication/331552609_Research_on_Different_Heuristics_for_Minimax_Algorithm_Insight_from_Connect-4_Game
+        """
+
+        # if top row as a single column open, make that move
+        # if top row has no open columns, return score
+        legal_moves = list(self.legal_moves())
+        game_copy = copy.deepcopy(self)
+        while len(legal_moves) == 1:
+            game_copy.make_move(legal_moves[0])
+            legal_moves = list(game_copy.legal_moves())
+
+        if len(legal_moves) == 0:
+            return game_copy.evaluate_final() * 10_000_000
+
+        score = 0
+        for bitmask in BITMASKS:
+            score += self.eval_features(bitmask, Player.RED)
+            score -= self.eval_features(bitmask, Player.YELLOW)
+
+        for r in range(ROWS):
+            for c in range(COLUMNS):
+                score += self[r, c].value * COLUMN_SCORE[c]  # feature 4
+
+        return score
+
+
 class TreeNode:
-    def __init__(self, board=0, score=None, move=None):
+    def __init__(self, board: GameState, score=None, move=None):
         self.board = board
         self.move = move
         self.score = score
@@ -53,13 +248,11 @@ def build_graph(node, dot=None, parent_label=None, depth=0, max_depth=5):
     node_label = f"{move_char}\n{node.score}"
 
     # Color based on player
-    red = bin(node.board & (2 ** 64 - 1)).count('1')
-    yellow = bin(node.board >> 64).count('1')
     dot.node(str(id(node)),
              label=node_label,
              shape='box',
              style='filled,rounded',
-             fillcolor='#ffcccc' if yellow >= red else '#ffffcc',
+             fillcolor='#ffcccc' if node.board.turn == Player.RED else '#ffffcc',
              color='gray',
              fontsize=str(24 + (1 - depth_factor) * 6),  # Shrink font with depth
              width=node_size,
@@ -90,170 +283,6 @@ def build_graph(node, dot=None, parent_label=None, depth=0, max_depth=5):
     return dot
 
 
-class Move:
-    def __init__(self, row, column):
-        self.row = row
-        self.column = column
-
-    def __repr__(self):
-        return f"M({self.row}, {self.column})"
-
-    # spread
-    def __iter__(self):
-        yield self.row
-        yield self.column
-
-
-class GameState:
-    def __init__(self, dim: Tuple[int, int] = (6, 7)):
-        self.ROWS, self.COLUMNS = dim
-        self.board = np.zeros((self.ROWS, self.COLUMNS), dtype=np.int8)
-        self.turn = Player.RED  # player about to play
-
-    def __getitem__(self, key) -> np.ndarray[Player] | Player:
-        arr = self.board[key]
-        if isinstance(arr, np.ndarray):
-            return np.vectorize(lambda x: Player(x))(arr)
-        return Player(arr)
-
-    def __setitem__(self, key, value: Player):
-        self.board[key] = value.value
-
-    def __repr__(self) -> str:
-        board_str = ""
-        for row in range(self.ROWS):
-            board_str += "|"
-            for col in range(self.COLUMNS):
-                board_str += 'x' if self[row, col] == Player.RED else ''
-                board_str += 'o' if self[row, col] == Player.YELLOW else ''
-                board_str += ' ' if self[row, col] == Player.NONE else ''
-                board_str += '|'
-            board_str += "\n"
-        return board_str
-
-    def __hash__(self):
-        yellow = int.from_bytes(np.packbits(self.board == Player.YELLOW.value))
-        red = int.from_bytes(np.packbits(self.board == Player.RED.value))
-
-        # canonical form, yellow is the smaller number
-        # hash of flipped board == hash of original board
-        # to ensure symmetrical positions are not duplicated
-        flipped = np.flip(self.board, axis=1)
-        flipped_yellow = int.from_bytes(np.packbits(flipped == Player.YELLOW.value))
-        flipped_red = int.from_bytes(np.packbits(flipped == Player.RED.value))
-
-        if flipped_yellow < yellow \
-                or flipped_yellow == yellow \
-                and flipped_red < red:
-            yellow = flipped_yellow
-            red = flipped_red
-
-        return yellow << 64 | red
-
-    def print_colored(self) -> str:
-        board_str = (str(self)
-                     .replace('x', '\033[91m●\033[0m')
-                     .replace('o', '\033[93m●\033[0m'))
-        return board_str
-
-    def is_game_over(self):
-        return np.all(self[0] != Player.NONE)
-
-    def make_move(self, move_col: int) -> None:
-        if self[0, move_col] != Player.NONE:
-            raise ValueError(f"Column {move_col} is full")
-        row = np.argwhere(self[:, move_col] == Player.NONE)[-1, 0]
-        self[row, move_col] = self.turn
-        self.turn = Player.YELLOW if self.turn == Player.RED else Player.RED
-
-    def column_order(self):
-        n = self.COLUMNS // 2
-        yield n
-        i = 1
-        while i <= n:
-            yield n + i
-            yield n - i
-            i += 1
-
-    def legal_moves(self) -> Generator[int, None, None]:
-        """
-        valid moves, with move ordering optimisation (center moves first)
-        :return: iterator for moves
-        """
-
-        for c in self.column_order():
-            if self[0, c] == Player.NONE:
-                yield c
-
-    def evaluate_final(self) -> int:
-        score = 0
-        for r in range(self.ROWS):
-            for c in range(self.COLUMNS):
-                for offset in OFFSETS:
-                    o = np.add([r, c], offset)
-                    if np.any(o < 0) or np.any(o >= [self.ROWS, self.COLUMNS]):
-                        continue
-                    if np.all(self[o[:, 0], o[:, 1]] == self[r, c]):
-                        score += self[r, c].value
-        return score
-
-    def eval_features(self, offset, player: Player) -> int:
-        if np.any(offset < 0) or np.any(offset >= [self.ROWS, self.COLUMNS]):
-            return 0
-        quad = self[offset[:, 0], offset[:, 1]]
-        offset_1 = 2 * offset[0] - offset[1]  # adjacent square to quad
-
-        player_1_count = np.count_nonzero(quad == player)
-        player_2_count = np.count_nonzero(quad == Player.YELLOW if player == Player.RED else Player.RED)
-        if player_2_count > 0 or player_1_count == 0:
-            return 0  # this will never lead to a connect-4
-
-        if player_1_count == 4:
-            return 10_000_000  # feature 1
-        elif player_1_count == 3:
-            try:
-                if self[offset_1[0], offset_1[1]] == Player.NONE and \
-                        self[offset_1[0], offset_1[1] - 1] == Player.NONE \
-                        and self[offset[3, 0], offset[3, 1]] == Player.NONE \
-                        and self[offset[3, 0], offset[3, 1] - 1] == Player.NONE:
-                    return 10_000_000  # feature 2.1
-            except IndexError:
-                pass
-            return 900_000
-        elif quad[0] == quad[1] == player \
-                or quad[1] == quad[2] == player \
-                or quad[2] == quad[3] == player:
-            return 50_000  # feature 3 (approximate)
-
-        return 0
-
-    def evaluate(self) -> int:
-        """
-        https://researchgate.net/publication/331552609_Research_on_Different_Heuristics_for_Minimax_Algorithm_Insight_from_Connect-4_Game
-        """
-
-        # if top row as a single column open, make that move
-        # if top row has no open columns, return score
-        open_cols = np.argwhere(self[0] == Player.NONE)
-        game_copy = copy.deepcopy(self)
-        while open_cols.size == 1:
-            # noinspection PyTypeChecker
-            game_copy.make_move(open_cols[0])
-            open_cols = np.argwhere(game_copy[0] == Player.NONE)
-        if open_cols.size == 0:
-            return game_copy.evaluate_final() * 10_000_000
-
-        score = 0
-        for r in range(self.ROWS):
-            for c in range(self.COLUMNS):
-                for offset in OFFSETS:
-                    score += self.eval_features(np.add([r, c], offset), Player.RED)
-                    score -= self.eval_features(np.add([r, c], offset), Player.YELLOW)
-                score += self[r, c].value * COLUMN_SCORE[c]  # feature 4
-
-        return score
-
-
 def minimax(game_state: GameState,
             depth=9,
             alpha=-float('inf'),
@@ -265,19 +294,19 @@ def minimax(game_state: GameState,
     game_hash = game_state.__hash__()
     if game_hash in TRANSPOSITION_TABLE:
         score = TRANSPOSITION_TABLE[game_hash]
-        return score, None, TreeNode(game_hash, score)
+        return score, None, TreeNode(game_state, score)
 
     if depth == 0 or game_state.is_game_over():
         score = game_state.evaluate()
         TRANSPOSITION_TABLE[game_hash] = score
-        return score, None, TreeNode(game_hash, score)
+        return score, None, TreeNode(game_state, score)
 
     is_max = game_state.turn == Player.RED
     best_score = -float('inf') if is_max else float('inf')
     best_move = None
     scores = [-1] * 7
     legal_moves = list(game_state.legal_moves())
-    tree = TreeNode(game_hash)
+    tree = TreeNode(game_state)
 
     for move in legal_moves:
         next_game_state = copy.deepcopy(game_state)
@@ -338,45 +367,68 @@ def minimax_cpp(game_state: GameState, depth=9) -> Tuple[int, int]:
     :param depth: depth to search
     :return: score and move
     """
-    ret = lib.minimax(game_state.board, game_state.turn.value, depth)
+    ret = lib.minimax(game_state.red, game_state.yellow, game_state.turn.value, depth)
     return ret.score, ret.col
 
 
-if __name__ == "__main__":
-    # load the C++ library
-
-    if ENABLE_CPP_MINIMAX:
-        class MinimaxRet(ctypes.Structure):
-            _fields_ = [
-                ("score", ctypes.c_int),
-                ("col", ctypes.c_int),
-            ]
-
-
-        lib = ctypes.CDLL(r"./libconnect4_eval.dll")
-        lib.minimax.argtypes = [
-            ndpointer(dtype=np.int8, ndim=2, flags='C_CONTIGUOUS'),
-            ctypes.c_int8,
-            ctypes.c_int,
-        ]
-        lib.minimax.restype = MinimaxRet
-
+def main():
     game = GameState()
 
     while not game.is_game_over():
         TRANSPOSITION_TABLE.clear()
         start = time.time()
-        score, move, tree = minimax(game, 3)
-        # build_graph(tree).render('game_tree')
+        if ENABLE_CPP_MINIMAX:
+            score, move = minimax_cpp(game, 13)
+        else:
+            score, move, tree = minimax(game, 7)
         print(f"Bot {game.turn}: Move: {move} ({time.time() - start:.2f}s)")
+        print(f"Score: {score}")
+        # build_graph(tree).render('game_tree')
 
         game.make_move(move)
         print(game.print_colored())
         # print(game)
 
-        # break
         if game.is_game_over():
             break
 
     print("Game over")
     print(game.evaluate_final())
+
+
+def collect_bits(number: int, mask: int) -> int:
+    result = 0
+    bit_pos = 0
+
+    while mask:
+        rightmost_mask_bit = mask & -mask
+        if number & rightmost_mask_bit:
+            result |= (1 << bit_pos)
+        bit_pos += 1
+        mask &= mask - 1
+
+    return result
+
+
+def load_cpp_lib():
+    class MinimaxRet(ctypes.Structure):
+        _fields_ = [
+            ("score", ctypes.c_int),
+            ("col", ctypes.c_int),
+        ]
+
+    lib = ctypes.CDLL(r"./libconnect4_eval.dll")
+    lib.minimax.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.minimax.restype = MinimaxRet
+    return lib
+
+
+if __name__ == "__main__":
+    if ENABLE_CPP_MINIMAX:
+        lib = load_cpp_lib()
+    main()
